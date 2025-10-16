@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AniVerse - Complete AWS Infrastructure for Anime Streaming Platform'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name (dev, staging, prod)
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  
+  DomainName:
+    Description: Domain name for the application (optional)
+    Type: String
+    Default: ""
+
+Resources:
+  # S3 Buckets for Media Storage
+  RawUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'aniverse-raw-uploads-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ProcessedMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'aniverse-processed-media-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudFront Origin Access Identity
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for AniVerse ${EnvironmentName}'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt ProcessedMediaBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: !Sub 'AniVerse CDN ${EnvironmentName}'
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+            Headers:
+              - Origin
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+          ViewerProtocolPolicy: redirect-to-https
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        CacheBehaviors:
+          - PathPattern: '*.m3u8'
+            TargetOriginId: S3Origin
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: none
+            ViewerProtocolPolicy: redirect-to-https
+            MinTTL: 0
+            DefaultTTL: 5
+            MaxTTL: 300
+          - PathPattern: '*.ts'
+            TargetOriginId: S3Origin
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            ViewerProtocolPolicy: redirect-to-https
+            MinTTL: 0
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+        PriceClass: PriceClass_100
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # S3 Bucket Policy for CloudFront
+  ProcessedMediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedMediaBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+            Action: 's3:GetObject'
+            Resource: !Sub '${ProcessedMediaBucket.Arn}/*'
+
+  # IAM Role for MediaConvert
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AniVerse-MediaConvert-Role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaConvertPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${RawUploadsBucket.Arn}/*'
+                  - !Sub '${ProcessedMediaBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Ref RawUploadsBucket
+                  - !Ref ProcessedMediaBucket
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AniVerse-Lambda-Role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConvertPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconvert:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt MediaConvertRole.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${RawUploadsBucket.Arn}/*'
+                  - !Sub '${ProcessedMediaBucket.Arn}/*'
+
+  # Lambda Function for Video Processing
+  VideoProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'aniverse-video-processing-${EnvironmentName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          MEDIACONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
+          PROCESSED_BUCKET: !Ref ProcessedMediaBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from urllib.parse import unquote_plus
+
+          def lambda_handler(event, context):
+              mediaconvert = boto3.client('mediaconvert')
+              
+              # Get MediaConvert endpoint
+              endpoints = mediaconvert.describe_endpoints()
+              endpoint_url = endpoints['Endpoints'][0]['Url']
+              mediaconvert = boto3.client('mediaconvert', endpoint_url=endpoint_url)
+              
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+                  
+                  # Generate unique job ID
+                  job_id = str(uuid.uuid4())
+                  
+                  # Create MediaConvert job
+                  job_settings = {
+                      'Role': os.environ['MEDIACONVERT_ROLE_ARN'],
+                      'Settings': {
+                          'Inputs': [{
+                              'AudioSelectors': {
+                                  'Audio Selector 1': {
+                                      'Offset': 0,
+                                      'DefaultSelection': 'DEFAULT',
+                                      'ProgramSelection': 1
+                                  }
+                              },
+                              'VideoSelector': {
+                                  'ColorSpace': 'FOLLOW',
+                                  'Rotate': 'DEGREE_0',
+                                  'AlphaBehavior': 'DISCARD'
+                              },
+                              'FilterEnable': 'AUTO',
+                              'PsiControl': 'USE_PSI',
+                              'FilterStrength': 0,
+                              'DeblockFilter': 'DISABLED',
+                              'DenoiseFilter': 'DISABLED',
+                              'TimecodeSource': 'EMBEDDED',
+                              'FileInput': f's3://{bucket}/{key}'
+                          }],
+                          'OutputGroups': [{
+                              'Name': 'HLS',
+                              'OutputGroupSettings': {
+                                  'Type': 'HLS_GROUP_SETTINGS',
+                                  'HlsGroupSettings': {
+                                      'ManifestDurationFormat': 'INTEGER',
+                                      'SegmentLength': 10,
+                                      'TimedMetadataId3Period': 10,
+                                      'CaptionLanguageSetting': 'OMIT',
+                                      'Destination': f's3://{os.environ["PROCESSED_BUCKET"]}/{job_id}/',
+                                      'TimedMetadataId3Frame': 'PRIV',
+                                      'CodecSpecification': 'RFC_4281',
+                                      'OutputSelection': 'MANIFESTS_AND_SEGMENTS',
+                                      'ProgramDateTimePeriod': 600,
+                                      'MinSegmentLength': 0,
+                                      'DirectoryStructure': 'SINGLE_DIRECTORY',
+                                      'ProgramDateTime': 'EXCLUDE',
+                                      'SegmentControl': 'SEGMENTED_FILES',
+                                      'ManifestCompression': 'NONE',
+                                      'ClientCache': 'ENABLED',
+                                      'StreamInfResolution': 'INCLUDE'
+                                  }
+                              },
+                              'Outputs': [
+                                  {
+                                      'NameModifier': '_1080p',
+                                      'Preset': 'System-Generic_Hd_Mp4_Avc_Aac_16x9_1920x1080p_24Hz_6Mbps',
+                                      'ContainerSettings': {
+                                          'Container': 'M3U8'
+                                      },
+                                      'VideoDescription': {
+                                          'Width': 1920,
+                                          'Height': 1080,
+                                          'CodecSettings': {
+                                              'Codec': 'H_264',
+                                              'H264Settings': {
+                                                  'InterlaceMode': 'PROGRESSIVE',
+                                                  'NumberReferenceFrames': 3,
+                                                  'Syntax': 'DEFAULT',
+                                                  'Softness': 0,
+                                                  'GopClosedCadence': 1,
+                                                  'GopSize': 90,
+                                                  'Slices': 1,
+                                                  'GopBReference': 'DISABLED',
+                                                  'SlowPal': 'DISABLED',
+                                                  'SpatialAdaptiveQuantization': 'ENABLED',
+                                                  'TemporalAdaptiveQuantization': 'ENABLED',
+                                                  'FlickerAdaptiveQuantization': 'DISABLED',
+                                                  'EntropyEncoding': 'CABAC',
+                                                  'Bitrate': 6000000,
+                                                  'FramerateControl': 'INITIALIZE_FROM_SOURCE',
+                                                  'RateControlMode': 'CBR',
+                                                  'CodecProfile': 'MAIN',
+                                                  'Telecine': 'NONE',
+                                                  'MinIInterval': 0,
+                                                  'AdaptiveQuantization': 'HIGH',
+                                                  'CodecLevel': 'AUTO',
+                                                  'FieldEncoding': 'PAFF',
+                                                  'SceneChangeDetect': 'ENABLED',
+                                                  'QualityTuningLevel': 'SINGLE_PASS',
+                                                  'FramerateConversionAlgorithm': 'DUPLICATE_DROP',
+                                                  'UnregisteredSeiTimecode': 'DISABLED',
+                                                  'GopSizeUnits': 'FRAMES',
+                                                  'ParControl': 'INITIALIZE_FROM_SOURCE',
+                                                  'NumberBFramesBetweenReferenceFrames': 2,
+                                                  'RepeatPps': 'DISABLED'
+                                              }
+                                          }
+                                      },
+                                      'AudioDescriptions': [{
+                                          'AudioTypeControl': 'FOLLOW_INPUT',
+                                          'CodecSettings': {
+                                              'Codec': 'AAC',
+                                              'AacSettings': {
+                                                  'AudioDescriptionBroadcasterMix': 'NORMAL',
+                                                  'Bitrate': 96000,
+                                                  'RateControlMode': 'CBR',
+                                                  'CodecProfile': 'LC',
+                                                  'CodingMode': 'CODING_MODE_2_0',
+                                                  'RawFormat': 'NONE',
+                                                  'SampleRate': 48000,
+                                                  'Specification': 'MPEG4'
+                                              }
+                                          },
+                                          'LanguageCodeControl': 'FOLLOW_INPUT',
+                                          'AudioSourceName': 'Audio Selector 1'
+                                      }]
+                                  },
+                                  {
+                                      'NameModifier': '_720p',
+                                      'Preset': 'System-Generic_Hd_Mp4_Avc_Aac_16x9_1280x720p_24Hz_3.5Mbps',
+                                      'ContainerSettings': {
+                                          'Container': 'M3U8'
+                                      },
+                                      'VideoDescription': {
+                                          'Width': 1280,
+                                          'Height': 720,
+                                          'CodecSettings': {
+                                              'Codec': 'H_264',
+                                              'H264Settings': {
+                                                  'InterlaceMode': 'PROGRESSIVE',
+                                                  'NumberReferenceFrames': 3,
+                                                  'Syntax': 'DEFAULT',
+                                                  'Softness': 0,
+                                                  'GopClosedCadence': 1,
+                                                  'GopSize': 90,
+                                                  'Slices': 1,
+                                                  'GopBReference': 'DISABLED',
+                                                  'SlowPal': 'DISABLED',
+                                                  'SpatialAdaptiveQuantization': 'ENABLED',
+                                                  'TemporalAdaptiveQuantization': 'ENABLED',
+                                                  'FlickerAdaptiveQuantization': 'DISABLED',
+                                                  'EntropyEncoding': 'CABAC',
+                                                  'Bitrate': 3500000,
+                                                  'FramerateControl': 'INITIALIZE_FROM_SOURCE',
+                                                  'RateControlMode': 'CBR',
+                                                  'CodecProfile': 'MAIN',
+                                                  'Telecine': 'NONE',
+                                                  'MinIInterval': 0,
+                                                  'AdaptiveQuantization': 'HIGH',
+                                                  'CodecLevel': 'AUTO',
+                                                  'FieldEncoding': 'PAFF',
+                                                  'SceneChangeDetect': 'ENABLED',
+                                                  'QualityTuningLevel': 'SINGLE_PASS',
+                                                  'FramerateConversionAlgorithm': 'DUPLICATE_DROP',
+                                                  'UnregisteredSeiTimecode': 'DISABLED',
+                                                  'GopSizeUnits': 'FRAMES',
+                                                  'ParControl': 'INITIALIZE_FROM_SOURCE',
+                                                  'NumberBFramesBetweenReferenceFrames': 2,
+                                                  'RepeatPps': 'DISABLED'
+                                              }
+                                          }
+                                      },
+                                      'AudioDescriptions': [{
+                                          'AudioTypeControl': 'FOLLOW_INPUT',
+                                          'CodecSettings': {
+                                              'Codec': 'AAC',
+                                              'AacSettings': {
+                                                  'AudioDescriptionBroadcasterMix': 'NORMAL',
+                                                  'Bitrate': 96000,
+                                                  'RateControlMode': 'CBR',
+                                                  'CodecProfile': 'LC',
+                                                  'CodingMode': 'CODING_MODE_2_0',
+                                                  'RawFormat': 'NONE',
+                                                  'SampleRate': 48000,
+                                                  'Specification': 'MPEG4'
+                                              }
+                                          },
+                                          'LanguageCodeControl': 'FOLLOW_INPUT',
+                                          'AudioSourceName': 'Audio Selector 1'
+                                      }]
+                                  }
+                              ]
+                          }]
+                      }
+                  }
+                  
+                  response = mediaconvert.create_job(**job_settings)
+                  print(f"Created MediaConvert job: {response['Job']['Id']}")
+                  
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Video processing started successfully')
+              }
+
+  # S3 Event Notification to Lambda
+  S3BucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'aniverse-raw-uploads-${EnvironmentName}-with-notification'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessingLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mp4
+
+  # Lambda Permission for S3
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref VideoProcessingLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::aniverse-raw-uploads-${EnvironmentName}-with-notification'
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'aniverse-notifications-${EnvironmentName}'
+      DisplayName: AniVerse Notifications
+
+  # Lambda Function for MediaConvert Job Completion
+  JobCompletionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'aniverse-job-completion-${EnvironmentName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          PROCESSED_BUCKET: !Ref ProcessedMediaBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              sns = boto3.client('sns')
+              
+              # Parse MediaConvert job completion event
+              detail = event['detail']
+              job_id = detail['jobId']
+              status = detail['status']
+              
+              if status == 'COMPLETE':
+                  # Job completed successfully
+                  output_group = detail['outputGroupDetails'][0]
+                  output_details = output_group['outputDetails'][0]
+                  output_file_paths = output_details['outputFilePaths']
+                  
+                  # Extract the manifest file path
+                  manifest_path = None
+                  for path in output_file_paths:
+                      if path.endswith('.m3u8'):
+                          manifest_path = path
+                          break
+                  
+                  if manifest_path:
+                      # Convert S3 path to CloudFront URL
+                      s3_key = manifest_path.replace(f's3://{os.environ["PROCESSED_BUCKET"]}/', '')
+                      cloudfront_url = f'https://{os.environ["CLOUDFRONT_DOMAIN"]}/{s3_key}'
+                      
+                      # Send notification
+                      message = {
+                          'job_id': job_id,
+                          'status': status,
+                          'hls_url': cloudfront_url,
+                          'message': 'Video processing completed successfully'
+                      }
+                      
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=json.dumps(message),
+                          Subject='AniVerse - Video Processing Complete'
+                      )
+              else:
+                  # Job failed
+                  message = {
+                      'job_id': job_id,
+                      'status': status,
+                      'message': 'Video processing failed'
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=json.dumps(message),
+                      Subject='AniVerse - Video Processing Failed'
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Notification sent successfully')
+              }
+
+  # EventBridge Rule for MediaConvert Job State Changes
+  MediaConvertJobRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'aniverse-mediaconvert-jobs-${EnvironmentName}'
+      Description: 'Capture MediaConvert job state changes'
+      EventPattern:
+        source: ['aws.mediaconvert']
+        detail-type: ['MediaConvert Job State Change']
+        detail:
+          status: ['COMPLETE', 'ERROR', 'CANCELED']
+      Targets:
+        - Arn: !GetAtt JobCompletionLambda.Arn
+          Id: JobCompletionTarget
+
+  # Lambda Permission for EventBridge
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobCompletionLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MediaConvertJobRule.Arn
+
+Outputs:
+  RawUploadsBucket:
+    Description: 'S3 bucket for raw video uploads'
+    Value: !Ref RawUploadsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawUploadsBucket'
+
+  ProcessedMediaBucket:
+    Description: 'S3 bucket for processed media files'
+    Value: !Ref ProcessedMediaBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedMediaBucket'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront Distribution Domain Name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
+
+  MediaConvertRoleArn:
+    Description: 'IAM Role ARN for MediaConvert'
+    Value: !GetAtt MediaConvertRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaConvertRoleArn'
+
+  VideoProcessingLambdaArn:
+    Description: 'Lambda function ARN for video processing'
+    Value: !GetAtt VideoProcessingLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoProcessingLambdaArn'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
