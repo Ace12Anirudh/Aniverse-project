@@ -2,7 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { User } from "@/types/auth";
-import { authApi } from "@/lib/api";
+import { authApi } from "../lib/api";
 
 interface AuthContextType {
   user: User | null;
@@ -47,10 +47,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = async (username: string, password: string) => {
     const response = await authApi.login(username, password);
     const newToken = response.access_token;
-    
+
     localStorage.setItem("token", newToken);
     setToken(newToken);
-    
+
     const userData = await authApi.getMe(newToken);
     setUser(userData);
   };
@@ -58,10 +58,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signup = async (username: string, email: string, password: string) => {
     const response = await authApi.signup(username, email, password);
     const newToken = response.access_token;
-    
+
     localStorage.setItem("token", newToken);
     setToken(newToken);
-    
+
     const userData = await authApi.getMe(newToken);
     setUser(userData);
   };
