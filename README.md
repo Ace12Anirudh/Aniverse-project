@@ -44,7 +44,7 @@ AniVerse/
 
 1. **Clone and setup**:
    ```bash
-   git clone <repository>
+   git clone <repo>
    cd AniVerse
    ```
 
